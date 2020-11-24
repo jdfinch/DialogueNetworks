@@ -56,4 +56,5 @@ for epoch in range(1, 201):
     log = 'Epoch: {:03d}, Train: {:.4f}, Val: {:.4f}, Test: {:.4f}'
     print(log.format(epoch, *test()))
 
-
+if __name__ == '__main__':
+    print('hello world')

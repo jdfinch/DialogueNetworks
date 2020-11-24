@@ -3,6 +3,8 @@ import networkx as nx
 from networkx import MultiDiGraph as Graph
 import pickle
 import os, shutil, sys
+import torch
+import numpy as np
 
 
 class Conversations(list):
@@ -10,7 +12,15 @@ class Conversations(list):
     def __init__(self):
         list.__init__(self)
         self.graph = Graph()
-        self.levi_graph = Graph()
+        self.concepts = {}
+        self.features = []
+        self.edgeindices = []
+        self.queries = []
+        self.target_classes = []
+        self.features_tensors = []
+        self.edges_tensors = []
+        self.queries_tensors = []
+        self.targets_tensors = []
 
     def compile(self):
         print('\nGraph compilation...', end='')
@@ -22,15 +32,61 @@ class Conversations(list):
                 print('.', end='', flush=True)
         print()
 
-    def compile_levi_graphs(self):
-        print('\nLevi graph compilation...', end='')
+    def _edges_to_tensors(self, edges, concept_to_features_function):
+        features = []
+        edge_idices = []
+        indices = {}
+        for source, target, label in edges:
+            for node in (source, target, label):
+                if node not in indices:
+                    indices[node] = len(indices)
+                    features.append(concept_to_features_function(node))
+            edge_idices.append([indices[target], indices[label]])
+            edge_idices.append([indices[label], indices[source]])
+        return features, edge_idices, indices
+
+    def _nodes_to_id(self):
+        for edge in self.graph.edges(keys=True):
+            for node in edge:
+                if node not in self.concepts:
+                    self.concepts[node] = len(self.concepts)
+
+    def compile_matrix_data(self, concept_to_features_function):
+        self.features = []
+        self.edgeindices = []
+        self.target_classes = []
+        self._nodes_to_id()
         for i, conversation in enumerate(self):
-            conversation.compile_levi_graphs()
-            for source, target in conversation.levi_graph.edges():
-                self.graph.add_edge(source, target)
+            edges_by_turn = [set(t.graph.edges(keys=True)) for t in conversation.turns]
+            for j in range(3, len(conversation.turns) - 1):
+                context_edges = set().union(*edges_by_turn[:j])
+                continuation_edges = set().union(*edges_by_turn[j:j+1]) - context_edges
+                features, edge_indices, indices = self._edges_to_tensors(context_edges, concept_to_features_function)
+                for source, target, label in continuation_edges:
+                    for qnode in source, 'query', label:
+                        if qnode not in indices:
+                            indices[qnode] = len(indices)
+                            features.append(concept_to_features_function(qnode))
+                    edge_indices.append([indices['query'], indices[label]])
+                    edge_indices.append([indices[label], indices[source]])
+                    target_class = self.concepts[target]
+                    self.features.append(features)
+                    self.edgeindices.append(edge_indices)
+                    self.target_classes.append(target_class)
             if i % 100 == 0:
                 print('.', end='', flush=True)
-        print()
+
+    def compile_matrices(self):
+        self.features_tensors = []
+        self.edges_tensors = []
+        self.targets_tensors = []
+        print('Compiling {} samples to tensors...'.format(len(self.features)))
+        for i in range(len(self.features)):
+            self.features_tensors.append(torch.from_numpy(np.array(self.features[i])))
+            self.edges_tensors.append(torch.from_numpy(np.array(self.edgeindices[i])))
+            self.targets_tensors.append(torch.from_numpy(np.array(self.target_classes[i])))
+            if i % 10000 == 0:
+                print('.', end='', flush=True)
 
     def save(self, filename):
         with open(filename, 'wb') as f:
@@ -48,18 +104,11 @@ class Conversation:
         self.text = ''
         self.turns = []
         self.graph = Graph()
-        self.levi_graph = Graph()
 
     def compile(self):
         for t in self.turns:
             for source, target, label in t.graph.edges(keys=True):
                 self.graph.add_edge(source, target, label)
-
-    def compile_levi_graphs(self):
-        for turn in self.turns:
-            turn.compile_levi_graph()
-            for source, target in turn.levi_graph.edges():
-                self.graph.add_edge(source, target)
 
     def save(self, filename):
         with open(filename, 'wb') as f:
@@ -81,14 +130,6 @@ class Turn:
         self.ner_tags = []
         self.map = {}
         self.graph = Graph()
-        self.levi_graph = Graph()
-
-    def compile_levi_graph(self):
-        self.levi_graph = Graph()
-        for source, target, label in self.graph.edges(keys=True):
-            self.levi_graph.add_edge(source, label)
-            self.levi_graph.add_edge(label, target)
-
 
 from itertools import chain
 import json
@@ -125,6 +166,8 @@ class AmrTransformer(Transformer):
             string = '?'
         elif '-' in string:
             string = string[:string.find('-')]
+        elif '' == string:
+            string = 'unk'
         string = ''.join([c for c in string if c.isalnum() or c in ' .?!'])
         return string
 
@@ -154,7 +197,7 @@ def parse_amr_graph(string, conversation_id, turn_id):
     transformer.transform(parse_tree)
     return transformer.graph
 
-def load_conversations_from(filename):
+def load_conversations_from(filename, limit=None):
     conversations = Conversations()
     idm = '# ::id '
     sntm = '# ::snt '
@@ -181,6 +224,8 @@ def load_conversations_from(filename):
                     conversations.append(conversation)
                     conversation_index = c_idx
                     conversation = Conversation()
+                    if limit is not None and len(conversations) > limit:
+                        break
                     if len(conversations) % 100 == 0:
                         print('...', len(conversations), end='', flush=True)
                 elif t_idx > turn_index:
@@ -209,12 +254,34 @@ def load_conversations_from(filename):
           '/', len(conversations), 'successfully parsed')
     return conversations
 
+import sister
+embedder = None
+memoization = {}
+def fasttext_embed(token):
+    global embedder
+    if embedder is None:
+        embedder = sister.MeanEmbedding(lang="en")
+    if token == '':
+        token = 'unk'
+    if token in memoization:
+        return memoization[token]
+    memoization[token] = embedder(token)
+    return memoization[token]
+
+import cProfile
+
 if __name__ == '__main__':
-    # convs = load_conversations_from('dailydialog/dd_graphinference_train.txt')
-    # convs.save('conversation_graphs.pckl')
-    convs = Conversations.load('conversation_graphs.pckl')
-    # convs.compile()
-    convs.compile_levi_graphs()
+    convs = load_conversations_from('dailydialog/dd_graphinference_train.txt', limit=100)
+    convs.save('conversation_graphs.pckl')
+    # convs = Conversations.load('conversation_graphs.pckl')
+    convs.compile()
+    convs.save('conversation_graphs.pckl')
+    print('\nCreating matrix data...\n')
+    convs.compile_matrix_data(fasttext_embed)
+    convs.save('conversation_graphs.pckl')
+    print('Bytes of convs:', sys.getsizeof(convs))
+    convs.compile_matrices()
+    print('compiled.')
     convs.save('conversation_graphs.pckl')
     print('done')
 
