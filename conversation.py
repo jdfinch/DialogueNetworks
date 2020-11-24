@@ -55,6 +55,7 @@ class Conversations(list):
         self.features = []
         self.edgeindices = []
         self.target_classes = []
+        self.queries = []
         self._nodes_to_id()
         for i, conversation in enumerate(self):
             edges_by_turn = [set(t.graph.edges(keys=True)) for t in conversation.turns]
@@ -63,12 +64,7 @@ class Conversations(list):
                 continuation_edges = set().union(*edges_by_turn[j:j+1]) - context_edges
                 features, edge_indices, indices = self._edges_to_tensors(context_edges, concept_to_features_function)
                 for source, target, label in continuation_edges:
-                    for qnode in source, 'query', label:
-                        if qnode not in indices:
-                            indices[qnode] = len(indices)
-                            features.append(concept_to_features_function(qnode))
-                    edge_indices.append([indices['query'], indices[label]])
-                    edge_indices.append([indices[label], indices[source]])
+                    self.queries.append([concept_to_features_function(source), concept_to_features_function(label)])
                     target_class = self.concepts[target]
                     self.features.append(features)
                     self.edgeindices.append(edge_indices)
@@ -79,11 +75,13 @@ class Conversations(list):
     def compile_matrices(self):
         self.features_tensors = []
         self.edges_tensors = []
+        self.queries_tensors = []
         self.targets_tensors = []
         print('Compiling {} samples to tensors...'.format(len(self.features)))
         for i in range(len(self.features)):
             self.features_tensors.append(torch.from_numpy(np.array(self.features[i])))
             self.edges_tensors.append(torch.from_numpy(np.array(self.edgeindices[i])))
+            self.queries_tensors.append(torch.from_numpy(np.array(self.queries[i])))
             self.targets_tensors.append(torch.from_numpy(np.array(self.target_classes[i])))
             if i % 10000 == 0:
                 print('.', end='', flush=True)
@@ -271,7 +269,7 @@ def fasttext_embed(token):
 import cProfile
 
 if __name__ == '__main__':
-    convs = load_conversations_from('dailydialog/dd_graphinference_train.txt', limit=100)
+    convs = load_conversations_from('dailydialog/dd_graphinference_train.txt', limit=3)
     convs.save('conversation_graphs.pckl')
     # convs = Conversations.load('conversation_graphs.pckl')
     convs.compile()
