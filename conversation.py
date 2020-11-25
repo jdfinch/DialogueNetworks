@@ -269,7 +269,7 @@ def fasttext_embed(token):
 import cProfile
 
 if __name__ == '__main__':
-    convs = load_conversations_from('dailydialog/dd_graphinference_train.txt', limit=3)
+    convs = load_conversations_from('dailydialog/dd_graphinference_train.txt', limit=None)
     convs.save('conversation_graphs.pckl')
     # convs = Conversations.load('conversation_graphs.pckl')
     convs.compile()

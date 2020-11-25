@@ -3,14 +3,17 @@ import os.path as osp
 
 import torch
 import torch.nn.functional as F
-import torch_geometric.transforms as T
+import torch_geometric as torchg
 from torch_geometric.nn import GATConv
+from torch_scatter.composite.softmax import scatter_softmax
+from torch_scatter import scatter_add
 
 from conversation import *
 
 conversations = Conversations.load('conversation_graphs.pckl')
 
-features = 300
+feature_size = 300
+batch_size = 1800
 classes = len(conversations.concepts)
 
 class Attention(torch.nn.Module):
@@ -21,99 +24,147 @@ class Attention(torch.nn.Module):
         self.decoder_dim = decoder_dim
         self.W = torch.nn.Parameter(torch.rand(self.decoder_dim, self.encoder_dim))
 
-    def forward(self,
-        query: torch.Tensor,  # [decoder_dim]
-        values: torch.Tensor, # [seq_length, encoder_dim]
-        ):
-        weights = query @ self.W @ values.T  # [seq_length]
-        weights = weights / np.sqrt(self.decoder_dim)  # [seq_length]
-        weights = torch.nn.functional.softmax(weights, dim=0)
-        return weights @ values  # [encoder_dim]
+    def forward(self, query, values, index):
+        """
+        query: torch.Tensor  [batch]
+        values: torch.Tensor [nodes, features]
+        index: torch.Tensor  [nodes]  (with batch number of labels)
+        """
+        transformed_values = self.W @ values.T  # [features, nodes]
+        attended_values = query @ transformed_values # [batch, nodes]
+        attended_values = attended_values / np.sqrt(self.decoder_dim)  # [batch, nodes]
+        weights = scatter_softmax(attended_values, index) # [batch, nodes]
+        weights = torch.gather(weights, 0, index.unsqueeze(0)).squeeze() # [nodes]
+        broadcastable = weights.unsqueeze(0)
+        weighted_values = broadcastable * values.T # [features, nodes] (broadcasts weights)
+        final_values = scatter_add(weighted_values.T, index, dim=0) # [batch, features]
+        return final_values
 
 class GraphInferencer(torch.nn.Module):
 
     def __init__(self):
         super(GraphInferencer, self).__init__()
-        self.conv = GATConv(features, features)
-        self.att = Attention(features, features * 2)
-        self.lin = torch.nn.Linear(features, classes)
-        self.test1 = torch.nn.Linear(features * 2, features * 2)
-        self.test2 = torch.nn.Linear(features * 2, features * 2)
-        self.test3 = torch.nn.Linear(features * 2, classes)
+        self.conv = GATConv(feature_size, feature_size)
+        self.att = Attention(feature_size, feature_size * 2)
+        self.lin = torch.nn.Linear(feature_size, classes)
+        self.test1 = torch.nn.Linear(feature_size * 2, feature_size * 2)
+        self.test2 = torch.nn.Linear(feature_size * 2, feature_size * 2)
+        self.test3 = torch.nn.Linear(feature_size * 2, classes)
 
-    def forward(self, features, edges, query):
+    def forward(self, x, edges, query, batch):
         # x = self.conv(features, edges)
-        # x = F.elu(x)
-        # x = self.att(query, x)
         # x = F.relu(x)
-        # x = self.lin(x)
-        x = self.test1(query)
+        x = self.att(query, x, batch)
         x = F.relu(x)
-        x = self.test2(x)
-        x = F.relu(x)
-        x = self.test3(x)
-        x = F.relu(x)
+        x = self.lin(x)
+
+        # x = self.test1(query)
+        # x = F.relu(x)
+        # x = self.test2(x)
+        # x = F.relu(x)
+        # x = self.test3(x)
+
         # x = torch.nn.functional.softmax(x)
         return x
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:3' if torch.cuda.is_available() else 'cpu')
 model = GraphInferencer().to(device)
 criterion = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.00001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
-def train(features, edges, queries, targets):
-    print('train MRR:', evaluate(features, edges, queries, targets))
-    batch = 1000
-    epochs = 1000
+def train(dataloader, test_dataloader, minitrain, epochs=5):
+    # print('initial train MRR:', evaluate(dataloader))
     model.train()
-    running_loss = 0.0
     for e in range(epochs):
+        running_loss = 0.0
         print('Epoch', e, '-----------')
-        for i in range(len(features)):
+        for batch in dataloader:
+            batch = batch.to(device)
             optimizer.zero_grad()
-            feature = features[i]
-            edge = edges[i]
-            target = targets[i]
-            query = queries[i]
-            output = model(feature, edge, query)
-            loss = criterion(output.unsqueeze(0), target.unsqueeze(0))
+            query = torch.reshape(batch.query, (-1, feature_size*2))
+            output = model(batch.x, batch.edge_index, query, batch.batch)
+            loss = criterion(output, batch.y)
             loss.backward()
             running_loss += loss.item()
             optimizer.step()
-        print('%5d loss: %.3f' % (e, running_loss / batch))
-        running_loss = 0.0
-        print('train MRR:', evaluate(features, edges, queries, targets))
+        print('%5d loss: %.3f' % (e, running_loss))
+        print('train MRR:', evaluate(minitrain))
+        print('test MRR:', evaluate(test_dataloader))
 
-
-def evaluate(features, edges, queries, targets):
+# pred = predicted[i]
+# if pred == cls:
+#     correct += 1
+def evaluate(dataloader):
     model.eval()
     with torch.no_grad():
         correct = 0
-        mrr_num = 0
-        mrr_denom = 0
-        for i in range(len(features)):
-            feature, edge, query = features[i], edges[i], queries[i]
-            output = model(feature, edge, query)
+        samples = 0
+        rank_total = 0
+        for batch in dataloader:
+            batch = batch.to(device)
+            query = torch.reshape(batch.query, (-1, feature_size * 2))
+            output = model(batch.x, batch.edge_index, query, batch.batch)
             sortout, indices = torch.sort(output, descending=True)
-            predicted = indices[0].item()
-            cls = targets[i].item()
-            if predicted == cls:
-                correct += 1
-            rank = ((indices == cls).nonzero()).item()
-            mrr_num += 1
-            mrr_denom += rank
+            predicted = indices[:,0]
+            for i in range(len(predicted)):
+                cls = batch.y[i]
+                rank = ((indices[i] == cls).nonzero()).item()
+                samples += 1
+                rank_total += (1/(rank+1))
             model.train()
-        return mrr_num / mrr_denom
+        return rank_total / samples
+
+def create_dataloader(features, edges, queries, targets):
+    datas = []
+    for i in range(len(features)):
+        data = torchg.data.Data(features[i], edges[i], y=targets[i])
+        data.query = queries[i]
+        datas.append(data)
+    dataloader = torchg.data.DataLoader(datas, batch_size=batch_size, shuffle=False)
+    return dataloader
+
+def softmax_test():
+    w = torch.Tensor([[5, 5, 4, 5, 1],
+                      [3, 7, 2, 1, 7]])
+    i = torch.LongTensor([0, 0, 1, 1, 1])
+
+    print(scatter_softmax(w, i))
+
+def gather_test():
+    w = torch.tensor([[5, 5, 4, 5, 1],
+                      [3, 7, 2, 1, 7]], dtype=torch.float)
+    i = torch.tensor([0, 0, 1, 1, 1], dtype=torch.long)
+
+    print(torch.gather(w, 0, i.unsqueeze(0)).squeeze())
+
+def scatter_add_test():
+    w = torch.tensor([[4, 1, 5],
+                      [6, 9, 5],
+                      [2, 3, 4],
+                      [3, 2, 1],
+                      [5, 5, 5]], dtype=torch.float)
+    i = torch.tensor([0, 0, 1, 1, 1], dtype=torch.long)
+    print(scatter_add(w, i, dim=0))
+
 
 if __name__ == '__main__':
     print('Features to gpu...')
-    features = [x.to(device) for x in conversations.features_tensors]
+    features = [x for x in conversations.features_tensors]
     print('Edges to gpu...')
-    edges = [x.to(device).transpose(0, 1) for x in conversations.edges_tensors]
+    edges = [x.transpose(0, 1) for x in conversations.edges_tensors]
     print('Queries to gpu...')
-    queries = [torch.cat((x[0], x[1])).to(device) for x in conversations.queries_tensors]
+    queries = [torch.cat((x[0], x[1])) for x in conversations.queries_tensors]
     print('Targets to gpu...')
-    targets = [x.to(device) for x in conversations.targets_tensors]
+    targets = [x for x in conversations.targets_tensors]
+
+    mts = int(len(features) * 0.1)
+    split = int(len(features) * 0.9)
+    train_data = create_dataloader(features[:split], edges[:split], queries[:split], targets[:split])
+    test_data = create_dataloader(features[split:], edges[split:], queries[split:], targets[split:])
+    minitrain = create_dataloader(features[:mts], edges[:mts], queries[:mts], targets[:mts])
+
     print('Training')
-    train(features, edges, queries, targets)
+    train(train_data, test_data, minitrain, epochs=100)
+
+
     print('\ndone')

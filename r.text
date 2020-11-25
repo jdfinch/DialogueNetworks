@@ -1,0 +1,19 @@
+
+
+Conversation Graph
+__________________
+
+Train MRR: 0.374
+Test MRR: 0.342
+
+-GAT
+
+Train MRR:
+Test MRR:
+
+
+Conversation Graph + Related
+____________________________
+
+Train MRR:
+Test MRR:
