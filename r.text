@@ -3,17 +3,38 @@
 Conversation Graph
 __________________
 
+3-layer ---
+
+Train MRR: 0.736
+Test MRR: 0.712
+
++ query to linear
+Train MRR: 0.738
+Test MRR: 0.713
+
+1-layer ---
+
+Train MRR: 0.727
+Test MRR: 0.671
+
+-ATT
+
+Train MRR: 0.626
+Test MRR: 0.545
+
+
+-Prev
 Train MRR: 0.374
 Test MRR: 0.342
 
--GAT
+-GAT - Prev
 
-Train MRR:
-Test MRR:
+Train MRR: 0.364
+Test MRR: 0.330
+
+-ATT - Prev
+
+Train MRR: 0.426
+Test MRR: 0.361
 
 
-Conversation Graph + Related
-____________________________
-
-Train MRR:
-Test MRR:

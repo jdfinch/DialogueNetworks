@@ -5,6 +5,7 @@ import pickle
 import os, shutil, sys
 import torch
 import numpy as np
+import random
 
 
 class Conversations(list):
@@ -32,7 +33,7 @@ class Conversations(list):
                 print('.', end='', flush=True)
         print()
 
-    def _edges_to_tensors(self, edges, concept_to_features_function):
+    def _edges_to_tensors(self, edges, previous_edges, supporting_edges, concept_to_features_function):
         features = []
         edge_idices = []
         indices = {}
@@ -40,7 +41,21 @@ class Conversations(list):
             for node in (source, target, label):
                 if node not in indices:
                     indices[node] = len(indices)
-                    features.append(concept_to_features_function(node))
+                    features.append(np.concatenate((concept_to_features_function(node), np.array([1, 1]))))
+            edge_idices.append([indices[target], indices[label]])
+            edge_idices.append([indices[label], indices[source]])
+        for source, target, label in previous_edges:
+            for node in (source, target, label):
+                if node not in indices:
+                    indices[node] = len(indices)
+                    features.append(np.concatenate((concept_to_features_function(node), np.array([1, 0]))))
+            edge_idices.append([indices[target], indices[label]])
+            edge_idices.append([indices[label], indices[source]])
+        for source, target, label in supporting_edges:
+            for node in (source, target, label):
+                if node not in indices:
+                    indices[node] = len(indices)
+                    features.append(np.concatenate((concept_to_features_function(node), np.array([0, 0]))))
             edge_idices.append([indices[target], indices[label]])
             edge_idices.append([indices[label], indices[source]])
         return features, edge_idices, indices
@@ -51,6 +66,26 @@ class Conversations(list):
                 if node not in self.concepts:
                     self.concepts[node] = len(self.concepts)
 
+    def _get_supporting_edges(self, edges, limit=1, step=1):
+        supporting = set()
+        for i in range(step):
+            for s, _, l in edges | supporting:
+                try:
+                    n1 = next(iter(self.graph.edges(s, keys=True)))
+                    supporting.add(n1)
+                    n2 = next(iter(self.graph.edges(n1, keys=True)))
+                    supporting.add(n2)
+                except StopIteration:
+                    pass
+                try:
+                    n1 = next(iter(self.graph.in_edges(l, keys=True)))
+                    supporting.add(n1)
+                    n2 = next(iter(self.graph.in_edges(n1, keys=True)))
+                    supporting.add(n2)
+                except StopIteration:
+                    pass
+        return supporting - edges
+
     def compile_matrix_data(self, concept_to_features_function):
         self.features = []
         self.edgeindices = []
@@ -60,9 +95,11 @@ class Conversations(list):
         for i, conversation in enumerate(self):
             edges_by_turn = [set(t.graph.edges(keys=True)) for t in conversation.turns]
             for j in range(3, len(conversation.turns) - 1):
-                context_edges = set().union(*edges_by_turn[:j])
+                context_edges = set().union(*edges_by_turn[:j-1])
+                previous_edges = set(edges_by_turn[j])
+                supporting_edges = self._get_supporting_edges(context_edges | previous_edges)
                 continuation_edges = set().union(*edges_by_turn[j:j+1]) - context_edges
-                features, edge_indices, indices = self._edges_to_tensors(context_edges, concept_to_features_function)
+                features, edge_indices, indices = self._edges_to_tensors(context_edges, previous_edges, supporting_edges, concept_to_features_function)
                 for source, target, label in continuation_edges:
                     self.queries.append([concept_to_features_function(source), concept_to_features_function(label)])
                     target_class = self.concepts[target]
@@ -269,18 +306,19 @@ def fasttext_embed(token):
 import cProfile
 
 if __name__ == '__main__':
+    filename = 'conversation_graphs_with_neighbors.pckl'
     convs = load_conversations_from('dailydialog/dd_graphinference_train.txt', limit=None)
-    convs.save('conversation_graphs.pckl')
-    # convs = Conversations.load('conversation_graphs.pckl')
+    convs.save(filename)
+    # convs = Conversations.load(filename)
     convs.compile()
-    convs.save('conversation_graphs.pckl')
+    convs.save(filename)
     print('\nCreating matrix data...\n')
     convs.compile_matrix_data(fasttext_embed)
-    convs.save('conversation_graphs.pckl')
+    convs.save(filename)
     print('Bytes of convs:', sys.getsizeof(convs))
     convs.compile_matrices()
     print('compiled.')
-    convs.save('conversation_graphs.pckl')
+    convs.save(filename)
     print('done')
 
 

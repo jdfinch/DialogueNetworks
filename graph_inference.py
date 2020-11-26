@@ -10,10 +10,11 @@ from torch_scatter import scatter_add
 
 from conversation import *
 
-conversations = Conversations.load('conversation_graphs.pckl')
+conversations = Conversations.load('conversation_graphs_with_prev_flagged.pckl')
 
-feature_size = 300
-batch_size = 1800
+feature_size = 302
+query_size = 600
+batch_size = 1500
 classes = len(conversations.concepts)
 
 class Attention(torch.nn.Module):
@@ -45,15 +46,23 @@ class GraphInferencer(torch.nn.Module):
     def __init__(self):
         super(GraphInferencer, self).__init__()
         self.conv = GATConv(feature_size, feature_size)
-        self.att = Attention(feature_size, feature_size * 2)
+        self.att = Attention(feature_size, query_size)
         self.lin = torch.nn.Linear(feature_size, classes)
-        self.test1 = torch.nn.Linear(feature_size * 2, feature_size * 2)
-        self.test2 = torch.nn.Linear(feature_size * 2, feature_size * 2)
-        self.test3 = torch.nn.Linear(feature_size * 2, classes)
+        self.ablationlin = torch.nn.Linear(feature_size + query_size, classes)
+        self.test1 = torch.nn.Linear(query_size, query_size)
+        self.test2 = torch.nn.Linear(query_size, query_size)
+        self.test3 = torch.nn.Linear(query_size, classes)
+        self.superlin = torch.nn.Linear(query_size + feature_size, feature_size)
 
     def forward(self, x, edges, query, batch):
-        # x = self.conv(features, edges)
-        # x = F.relu(x)
+        x = self.conv(x, edges)
+        x = F.relu(x)
+        x = self.conv(x, edges)
+        x = F.relu(x)
+        x = self.conv(x, edges)
+        x = F.relu(x)
+        # x = scatter_add(x, batch, dim=0)  # [batch, features]
+        # x = torch.cat((x, query), dim=1)
         x = self.att(query, x, batch)
         x = F.relu(x)
         x = self.lin(x)
@@ -81,7 +90,7 @@ def train(dataloader, test_dataloader, minitrain, epochs=5):
         for batch in dataloader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            query = torch.reshape(batch.query, (-1, feature_size*2))
+            query = torch.reshape(batch.query, (-1, query_size))
             output = model(batch.x, batch.edge_index, query, batch.batch)
             loss = criterion(output, batch.y)
             loss.backward()
@@ -102,7 +111,7 @@ def evaluate(dataloader):
         rank_total = 0
         for batch in dataloader:
             batch = batch.to(device)
-            query = torch.reshape(batch.query, (-1, feature_size * 2))
+            query = torch.reshape(batch.query, (-1, query_size))
             output = model(batch.x, batch.edge_index, query, batch.batch)
             sortout, indices = torch.sort(output, descending=True)
             predicted = indices[:,0]
@@ -149,11 +158,11 @@ def scatter_add_test():
 
 if __name__ == '__main__':
     print('Features to gpu...')
-    features = [x for x in conversations.features_tensors]
+    features = [x.float() for x in conversations.features_tensors]
     print('Edges to gpu...')
     edges = [x.transpose(0, 1) for x in conversations.edges_tensors]
     print('Queries to gpu...')
-    queries = [torch.cat((x[0], x[1])) for x in conversations.queries_tensors]
+    queries = [torch.cat((x[0], x[1])).float() for x in conversations.queries_tensors]
     print('Targets to gpu...')
     targets = [x for x in conversations.targets_tensors]
 
@@ -164,7 +173,7 @@ if __name__ == '__main__':
     minitrain = create_dataloader(features[:mts], edges[:mts], queries[:mts], targets[:mts])
 
     print('Training')
-    train(train_data, test_data, minitrain, epochs=100)
+    train(train_data, test_data, minitrain, epochs=10)
 
 
     print('\ndone')
